@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Drawing;
 using System.Windows.Forms;
 using System.IO;
@@ -8,7 +8,7 @@ using System.Threading;
 using System.Collections.Generic;
 using System.Security.Principal;
 using System.Net;
-using System.Text.RegularExpressions;
+using System.Web.Script.Serialization;
 
 namespace KickFox
 {
@@ -123,7 +123,7 @@ namespace KickFox
 
     public class MonitorForm : Form
     {
-        public const string CURRENT_VERSION = "v1.0.0";
+        public const string CURRENT_VERSION = "v" + AppInfo.Version;
         
         private EventWaitHandle showEvent;
         private Thread showEventThread;
@@ -137,6 +137,15 @@ namespace KickFox
         private Config config;
         private string configPath;
         private string logPath;
+
+        // Dynamic Icons
+        private Icon iconNormal;
+        private Icon iconKickA;
+        private Icon iconKickB;
+        private Icon iconFatal;
+        private System.Windows.Forms.Timer animTimer;
+        private bool isAnimFrameA = true;
+        private string currentTrayMode = "Normal"; // Normal, Kick, Fatal
 
         // UI Controls
         private CheckBox chkEnable;
@@ -174,6 +183,9 @@ namespace KickFox
             configPath = Path.Combine(appData, "config.ini");
             logPath = Path.Combine(appData, "monitor_log.txt");
             LoadConfig();
+            ApplyStagedUpdater();
+
+            LoadDynamicIcons();
 
             InitializeUI();
             InitializeTray();
@@ -184,9 +196,52 @@ namespace KickFox
                 this.WindowState = FormWindowState.Minimized;
                 this.ShowInTaskbar = false;
             }
-            
-            // Auto update check
-            CheckForUpdates(false);
+        }
+
+        private void LoadDynamicIcons()
+        {
+            var asm = System.Reflection.Assembly.GetExecutingAssembly();
+            try { iconNormal = new Icon(asm.GetManifestResourceStream("IconNormal.ico")); } catch { iconNormal = SystemIcons.Shield; }
+            try { iconKickA = new Icon(asm.GetManifestResourceStream("IconKickA.ico")); } catch { iconKickA = SystemIcons.Warning; }
+            try { iconKickB = new Icon(asm.GetManifestResourceStream("IconKickB.ico")); } catch { iconKickB = SystemIcons.Warning; }
+            try { iconFatal = new Icon(asm.GetManifestResourceStream("IconFatal.ico")); } catch { iconFatal = SystemIcons.Error; }
+
+            animTimer = new System.Windows.Forms.Timer();
+            animTimer.Interval = 500;
+            animTimer.Tick += AnimTimer_Tick;
+        }
+
+        private void AnimTimer_Tick(object sender, EventArgs e)
+        {
+            isAnimFrameA = !isAnimFrameA;
+            if (currentTrayMode == "Kick")
+            {
+                trayIcon.Icon = isAnimFrameA ? iconKickA : iconKickB;
+            }
+        }
+
+        private void SetTrayState(string mode, string tooltipText)
+        {
+            currentTrayMode = mode;
+            if (mode == "Normal")
+            {
+                animTimer.Stop();
+                trayIcon.Icon = iconNormal;
+            }
+            else if (mode == "Kick")
+            {
+                animTimer.Start();
+                trayIcon.Icon = iconKickA;
+                isAnimFrameA = true;
+            }
+            else if (mode == "Fatal")
+            {
+                animTimer.Stop();
+                trayIcon.Icon = iconFatal;
+            }
+
+            if (tooltipText.Length > 63) tooltipText = tooltipText.Substring(0, 60) + "...";
+            trayIcon.Text = tooltipText;
         }
 
         private void WaitShowEvent()
@@ -286,13 +341,11 @@ namespace KickFox
             this.MaximizeBox = false;
             this.StartPosition = FormStartPosition.CenterScreen;
 
-            // Enable Checkbox
             chkEnable = new CheckBox(); chkEnable.Text = "Enable KickFox Monitoring"; chkEnable.Location = new Point(20, 15); chkEnable.AutoSize = true; 
             chkEnable.Font = new Font(chkEnable.Font, FontStyle.Bold);
             chkEnable.Checked = config.IsEnabled;
             chkEnable.CheckedChanged += delegate { grpSettings.Enabled = chkEnable.Checked; };
 
-            // Settings GroupBox
             grpSettings = new GroupBox(); grpSettings.Text = "Monitor Settings"; grpSettings.Location = new Point(20, 45); grpSettings.Size = new Size(360, 265);
             grpSettings.Enabled = config.IsEnabled;
 
@@ -356,7 +409,6 @@ namespace KickFox
             grpSettings.Controls.Add(btnMoveUp);
             grpSettings.Controls.Add(btnMoveDown);
 
-            // Update Settings Panel
             GroupBox grpUpdate = new GroupBox(); grpUpdate.Text = "Updates"; grpUpdate.Location = new Point(20, 320); grpUpdate.Size = new Size(360, 60);
             var lblUpdate = new Label(); lblUpdate.Text = "Check every (days):"; lblUpdate.Location = new Point(20, 25); lblUpdate.AutoSize = true;
             txtUpdateDays = new TextBox(); txtUpdateDays.Text = config.UpdateCheckDays.ToString(); txtUpdateDays.Location = new Point(135, 22); txtUpdateDays.Width = 40;
@@ -366,14 +418,12 @@ namespace KickFox
             grpUpdate.Controls.Add(txtUpdateDays);
             grpUpdate.Controls.Add(btnCheckUpdate);
 
-            // Status Panel
             grpStatus = new GroupBox(); grpStatus.Text = "System Status"; grpStatus.Location = new Point(20, 390); grpStatus.Size = new Size(360, 75);
             pnlStatusLight = new Panel(); pnlStatusLight.Location = new Point(20, 30); pnlStatusLight.Size = new Size(20, 20); pnlStatusLight.BackColor = Color.Gray;
             lblStatus = new Label(); lblStatus.Text = "Ready\nLast Checked: N/A\nFailed Retries: 0"; lblStatus.Location = new Point(50, 20); lblStatus.AutoSize = false; lblStatus.Size = new Size(300, 50); lblStatus.ForeColor = Color.DarkSlateGray;
             grpStatus.Controls.Add(pnlStatusLight);
             grpStatus.Controls.Add(lblStatus);
 
-            // Bottom Buttons
             btnConfirm = new Button(); btnConfirm.Text = "Confirm"; btnConfirm.Location = new Point(140, 475); btnConfirm.Width = 75; btnConfirm.Height = 30;
             btnConfirm.Click += delegate { ApplySettings(); this.Close(); };
 
@@ -394,110 +444,226 @@ namespace KickFox
             this.FormClosing += MonitorForm_FormClosing;
         }
 
-        private void CheckForUpdates(bool manual)
-        {
-            DateTime lastCheck;
-            if (!DateTime.TryParse(config.LastUpdateCheck, out lastCheck)) lastCheck = DateTime.MinValue;
+        // ───────────────────────── Auto-update ─────────────────────────
 
-            if (!manual && config.UpdateCheckDays > 0)
+        private class ReleaseInfo
+        {
+            public string Tag;
+            public string ZipUrl;
+            public string SigUrl;
+        }
+
+        /// <summary>Swap in an updater that was staged by a previous update (Updater.exe can't overwrite itself).</summary>
+        private void ApplyStagedUpdater()
+        {
+            try
             {
-                if ((DateTime.Now - lastCheck).TotalDays < config.UpdateCheckDays)
-                {
-                    return; // Too early to auto check
-                }
+                string dir = AppDomain.CurrentDomain.BaseDirectory;
+                string staged = Path.Combine(dir, "Updater.new.exe");
+                string current = Path.Combine(dir, "Updater.exe");
+                if (!File.Exists(staged)) return;
+                if (File.Exists(current)) File.Delete(current);
+                File.Move(staged, current);
+                Log("Installed staged Updater.exe.");
+            }
+            catch (Exception ex)
+            {
+                Log("Failed to install staged Updater.exe: " + ex.Message);
+            }
+        }
+
+        private void RunOnUI(Action action)
+        {
+            if (this.IsDisposed) return;
+            try
+            {
+                if (this.InvokeRequired) this.BeginInvoke(action);
+                else action();
+            }
+            catch (InvalidOperationException) { }
+        }
+
+        private static Version ParseVersion(string tag)
+        {
+            if (string.IsNullOrEmpty(tag)) return null;
+            string s = tag.Trim().TrimStart('v', 'V');
+            int cut = s.IndexOfAny(new[] { '-', '+' });
+            if (cut >= 0) s = s.Substring(0, cut);
+            Version v;
+            if (!Version.TryParse(s, out v)) return null;
+            return new Version(v.Major, v.Minor, Math.Max(v.Build, 0)); // treat "1.1" as "1.1.0"
+        }
+
+        private static WebClient CreateWebClient()
+        {
+            ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
+            var client = new WebClient();
+            client.Encoding = System.Text.Encoding.UTF8;
+            client.Headers.Add("User-Agent", "KickFox-Updater/" + AppInfo.Version);
+            return client;
+        }
+
+        private static ReleaseInfo FetchLatestRelease()
+        {
+            string json;
+            using (WebClient client = CreateWebClient())
+            {
+                client.Headers.Add("Accept", "application/vnd.github+json");
+                json = client.DownloadString("https://api.github.com/repos/" + AppInfo.GitHubRepo + "/releases/latest");
             }
 
-            ThreadPool.QueueUserWorkItem(state => {
-                try
+            var release = new JavaScriptSerializer().DeserializeObject(json) as Dictionary<string, object>;
+            if (release == null || !release.ContainsKey("tag_name"))
+                throw new InvalidDataException("Unexpected response from GitHub.");
+
+            var info = new ReleaseInfo();
+            info.Tag = Convert.ToString(release["tag_name"]);
+
+            object assets;
+            if (release.TryGetValue("assets", out assets) && assets is object[])
+            {
+                foreach (object item in (object[])assets)
                 {
-                    if (manual) this.Invoke(new Action(delegate { btnCheckUpdate.Text = "Checking..."; btnCheckUpdate.Enabled = false; }));
-                    
-                    ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
-                    using (WebClient client = new WebClient())
-                    {
-                        client.Headers.Add("User-Agent", "KickFox-Updater");
-                        string json = client.DownloadString("https://api.github.com/repos/asdshawn/KickFox/releases/latest");
-                        
-                        Match tagMatch = Regex.Match(json, "\"tag_name\":\\s*\"(v[^\"]+)\"");
-                        if (tagMatch.Success)
-                        {
-                            string latestVersion = tagMatch.Groups[1].Value;
-                            if (latestVersion != CURRENT_VERSION)
-                            {
-                                Match urlMatch = Regex.Match(json, "\"browser_download_url\":\\s*\"([^\"]+\\.zip)\"");
-                                if (urlMatch.Success)
-                                {
-                                    string downloadUrl = urlMatch.Groups[1].Value;
-                                    this.Invoke(new Action(delegate { PromptUpdate(latestVersion, downloadUrl); }));
-                                }
-                            }
-                            else if (manual)
-                            {
-                                MessageBox.Show("You are using the latest version of KickFox.", "No Updates", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                            }
-                        }
-                    }
-                    
-                    config.LastUpdateCheck = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
-                    SaveConfig();
+                    var asset = item as Dictionary<string, object>;
+                    if (asset == null || !asset.ContainsKey("name") || !asset.ContainsKey("browser_download_url")) continue;
+                    string name = Convert.ToString(asset["name"]);
+                    string url = Convert.ToString(asset["browser_download_url"]);
+                    // Match exact asset names only — never "the first .zip we happen to see".
+                    if (name.Equals(AppInfo.UpdateAssetName, StringComparison.OrdinalIgnoreCase)) info.ZipUrl = url;
+                    else if (name.Equals(AppInfo.SignatureAssetName, StringComparison.OrdinalIgnoreCase)) info.SigUrl = url;
                 }
-                catch (Exception ex)
-                {
-                    if (manual) MessageBox.Show("Failed to check for updates: " + ex.Message, "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                }
-                finally
-                {
-                    if (manual && this.IsHandleCreated) this.Invoke(new Action(delegate { btnCheckUpdate.Text = "Check Now"; btnCheckUpdate.Enabled = true; }));
-                }
+            }
+            return info;
+        }
+
+        private void CheckForUpdates(bool manual)
+        {
+            if (!manual && config.UpdateCheckDays > 0)
+            {
+                DateTime lastCheck;
+                if (!DateTime.TryParse(config.LastUpdateCheck, out lastCheck)) lastCheck = DateTime.MinValue;
+                if ((DateTime.Now - lastCheck).TotalDays < config.UpdateCheckDays) return;
+            }
+
+            if (manual)
+            {
+                btnCheckUpdate.Text = "Checking...";
+                btnCheckUpdate.Enabled = false;
+            }
+
+            ThreadPool.QueueUserWorkItem(state =>
+            {
+                ReleaseInfo info = null;
+                Exception error = null;
+                try { info = FetchLatestRelease(); }
+                catch (Exception ex) { error = ex; }
+                RunOnUI(delegate { OnUpdateCheckCompleted(manual, info, error); });
             });
         }
 
-        private void PromptUpdate(string newVersion, string downloadUrl)
+        private void OnUpdateCheckCompleted(bool manual, ReleaseInfo info, Exception error)
         {
-            DialogResult result = MessageBox.Show(string.Format("A new version of KickFox ({0}) is available!\n\nWould you like to download and install it now?", newVersion), 
-                "Update Available", MessageBoxButtons.YesNo, MessageBoxIcon.Information);
-            
-            if (result == DialogResult.Yes)
+            btnCheckUpdate.Text = "Check Now";
+            btnCheckUpdate.Enabled = true;
+
+            if (error != null)
             {
-                btnCheckUpdate.Text = "Downloading...";
-                btnCheckUpdate.Enabled = false;
-                
-                ThreadPool.QueueUserWorkItem(state => {
-                    try
-                    {
-                        string tempFile = Path.Combine(Path.GetTempPath(), "KickFoxUpdate.zip");
-                        using (WebClient client = new WebClient())
-                        {
-                            client.Headers.Add("User-Agent", "KickFox-Updater");
-                            client.DownloadFile(downloadUrl, tempFile);
-                        }
-                        
-                        string updaterPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Updater.exe");
-                        if (File.Exists(updaterPath))
-                        {
-                            var psi = new ProcessStartInfo(updaterPath, string.Format("\"{0}\"", tempFile));
-                            psi.UseShellExecute = true;
-                            psi.Verb = "runas"; // Updater needs admin to overwrite files
-                            Process.Start(psi);
-                            Application.Exit(); // Close main app to allow overwriting
-                        }
-                        else
-                        {
-                            MessageBox.Show("Updater.exe not found! Cannot perform auto-update.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        MessageBox.Show("Download failed: " + ex.Message, "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    }
-                    finally
-                    {
-                        if (this.IsHandleCreated) this.Invoke(new Action(delegate { btnCheckUpdate.Text = "Check Now"; btnCheckUpdate.Enabled = true; }));
-                    }
-                });
+                Log("Update check failed: " + error.Message);
+                if (manual) MessageBox.Show(this, "Failed to check for updates: " + error.Message, "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
             }
+
+            config.LastUpdateCheck = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+            SaveConfig();
+
+            Version latest = ParseVersion(info.Tag);
+            Version current = ParseVersion(AppInfo.Version);
+            if (latest == null || current == null || latest <= current)
+            {
+                if (manual) MessageBox.Show(this, string.Format("You are using the latest version of KickFox ({0}).", CURRENT_VERSION), "No Updates", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            if (info.ZipUrl == null || info.SigUrl == null)
+            {
+                Log(string.Format("Release {0} is missing {1} or {2}; skipping auto-update.", info.Tag, AppInfo.UpdateAssetName, AppInfo.SignatureAssetName));
+                if (manual) MessageBox.Show(this, string.Format("KickFox {0} is available, but it cannot be installed automatically.\n\nPlease download the installer from:\nhttps://github.com/{1}/releases/latest", info.Tag, AppInfo.GitHubRepo), "Update Available", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            PromptUpdate(info);
         }
 
+        private void PromptUpdate(ReleaseInfo info)
+        {
+            DialogResult result = MessageBox.Show(
+                string.Format("A new version of KickFox ({0}) is available. You are using {1}.\n\nDownload and install it now?", info.Tag, CURRENT_VERSION),
+                "Update Available", MessageBoxButtons.YesNo, MessageBoxIcon.Information);
+            if (result != DialogResult.Yes) return;
+
+            btnCheckUpdate.Text = "Downloading...";
+            btnCheckUpdate.Enabled = false;
+
+            ThreadPool.QueueUserWorkItem(state =>
+            {
+                string dir = Path.Combine(Path.GetTempPath(), "KickFoxDownload");
+                string zipPath = Path.Combine(dir, AppInfo.UpdateAssetName);
+                string sigPath = Path.Combine(dir, AppInfo.SignatureAssetName);
+                string error = null;
+                try
+                {
+                    Directory.CreateDirectory(dir);
+                    using (WebClient client = CreateWebClient()) client.DownloadFile(info.ZipUrl, zipPath);
+                    using (WebClient client = CreateWebClient()) client.DownloadFile(info.SigUrl, sigPath);
+
+                    string reason;
+                    if (!UpdateVerifier.Verify(zipPath, sigPath, out reason))
+                    {
+                        error = "The downloaded update failed signature verification and was discarded.\n\n" + reason;
+                        try { File.Delete(zipPath); File.Delete(sigPath); } catch { }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    error = "Download failed: " + ex.Message;
+                }
+                RunOnUI(delegate { OnUpdateDownloaded(info, zipPath, sigPath, error); });
+            });
+        }
+
+        private void OnUpdateDownloaded(ReleaseInfo info, string zipPath, string sigPath, string error)
+        {
+            btnCheckUpdate.Text = "Check Now";
+            btnCheckUpdate.Enabled = true;
+
+            if (error != null)
+            {
+                Log(error.Replace("\n", " "));
+                MessageBox.Show(error, "Update Failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            string updaterPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Updater.exe");
+            if (!File.Exists(updaterPath))
+            {
+                MessageBox.Show("Updater.exe not found! Please reinstall KickFox from GitHub.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            try
+            {
+                var psi = new ProcessStartInfo(updaterPath, string.Format("\"{0}\" \"{1}\"", zipPath, sigPath));
+                psi.UseShellExecute = true;
+                psi.Verb = "runas";
+                Process.Start(psi);
+                Log("Signature verified. Handing over to Updater.exe for " + info.Tag);
+                OnExit(null, null); // Updater waits for this process to exit, then restarts KickFox.
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Could not start the updater: " + ex.Message, "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
         private void LoadConfigToUI()
         {
             txtInterval.Text = config.CheckIntervalSeconds.ToString();
@@ -532,10 +698,12 @@ namespace KickFox
             if (!config.IsEnabled)
             {
                 UpdateStatusUI(Color.Gray, "Monitoring is Disabled.");
+                SetTrayState("Fatal", "KickFox: 監控已停用");
             }
             else
             {
                 UpdateStatusUI(Color.LimeGreen, "Monitoring is Enabled. Waiting for next tick...");
+                SetTrayState("Normal", "KickFox: 等待首次檢查中...");
             }
         }
 
@@ -547,11 +715,11 @@ namespace KickFox
             trayMenu.MenuItems.Add("Exit Monitor", OnExit);
 
             trayIcon = new NotifyIcon();
-            trayIcon.Text = "KickFox (Active)";
-            trayIcon.Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
             trayIcon.ContextMenu = trayMenu;
             trayIcon.Visible = true;
             trayIcon.DoubleClick += OnSettings;
+            
+            SetTrayState("Normal", "KickFox: 啟動中...");
         }
 
         private void InitializeTimer()
@@ -564,6 +732,7 @@ namespace KickFox
             if (!config.IsEnabled)
             {
                 UpdateStatusUI(Color.Gray, "Monitoring is Disabled.");
+                SetTrayState("Fatal", "KickFox: 監控已停用");
             }
             else
             {
@@ -574,11 +743,7 @@ namespace KickFox
 
         private void MonitorTimer_Tick(object sender, EventArgs e)
         {
-            if (!config.IsEnabled)
-            {
-                return;
-            }
-
+            if (!config.IsEnabled) return;
             if (isChecking) return;
 
             if (isSleeping)
@@ -605,6 +770,7 @@ namespace KickFox
             try
             {
                 bool isOnline = false;
+                long pingTime = 0;
 
                 foreach (var target in config.PingTargets)
                 {
@@ -616,6 +782,7 @@ namespace KickFox
                             if (reply.Status == IPStatus.Success)
                             {
                                 isOnline = true;
+                                pingTime = reply.RoundtripTime;
                                 break;
                             }
                         }
@@ -631,6 +798,9 @@ namespace KickFox
                         Log("Network connection restored successfully.");
                     }
                     UpdateStatusUI(Color.LimeGreen, "Network is online");
+                    this.Invoke(new Action(() => {
+                        SetTrayState("Normal", string.Format("KickFox: 連線正常 (Ping: {0}ms)", pingTime));
+                    }));
                 }
                 else
                 {
@@ -646,10 +816,17 @@ namespace KickFox
                         sleepUntil = DateTime.Now.AddMinutes(30);
                         UpdateStatusUI(Color.Red, "Max retries reached. Sleeping for 30 mins.");
                         Log("Max retries reached. Entering sleep mode for 30 mins to prevent infinite loops.");
+                        
+                        this.Invoke(new Action(() => {
+                            SetTrayState("Fatal", "KickFox: 重啟失敗，請檢查實體數據機或線路");
+                        }));
                     }
                     else
                     {
                         UpdateStatusUI(Color.Gold, "Restarting adapter...");
+                        this.Invoke(new Action(() => {
+                            SetTrayState("Kick", "KickFox: 偵測到斷線，正在踢醒網卡...");
+                        }));
                         RestartWifi();
                     }
                 }
@@ -679,7 +856,7 @@ namespace KickFox
                 }
                 UpdateStatusUI(Color.Gold, "Wi-Fi restarted. Waiting 20s...");
                 Log("Wi-Fi restarted. Waiting 20s for reconnection...");
-                Thread.Sleep(20000); // Give time for adapter to connect to AP
+                Thread.Sleep(20000); 
             }
             catch (Exception ex)
             {
@@ -705,11 +882,14 @@ namespace KickFox
                 this.Hide();
                 this.ShowInTaskbar = false;
             }
+
+            // Window handle now exists, so background results can be marshalled back safely.
+            CheckForUpdates(false);
         }
 
         private void OnSettings(object sender, EventArgs e)
         {
-            LoadConfigToUI(); // Ensure UI reflects current background state when reopened
+            LoadConfigToUI();
             this.Show();
             this.WindowState = FormWindowState.Normal;
             this.ShowInTaskbar = true;

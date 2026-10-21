@@ -1,8 +1,9 @@
-using System;
+﻿using System;
 using System.Drawing;
 using System.Windows.Forms;
 using System.IO;
 using System.Diagnostics;
+using System.Reflection;
 using System.Security.Principal;
 using Microsoft.Win32;
 
@@ -137,6 +138,43 @@ namespace KickFox
             }
         }
 
+        private static readonly string[] PayloadFiles = { "KickFox.exe", "KickFoxUninstaller.exe", "Updater.exe" };
+
+        private static void ExtractPayload(string fileName, string destPath)
+        {
+            using (Stream s = Assembly.GetExecutingAssembly().GetManifestResourceStream("payload." + fileName))
+            {
+                if (s != null)
+                {
+                    using (FileStream fs = new FileStream(destPath, FileMode.Create, FileAccess.Write)) s.CopyTo(fs);
+                    return;
+                }
+            }
+
+            // Fallback for developer builds: use a file placed next to the installer.
+            string sideBySide = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, fileName);
+            if (!File.Exists(sideBySide))
+                throw new FileNotFoundException("This installer does not contain " + fileName + ". Please download KickFoxInstaller.exe again from GitHub Releases.", fileName);
+            File.Copy(sideBySide, destPath, true);
+        }
+
+        private static void StopRunningInstances()
+        {
+            try
+            {
+                var psi = new ProcessStartInfo("schtasks.exe", "/end /tn \"KickFox\"");
+                psi.CreateNoWindow = true;
+                psi.UseShellExecute = false;
+                using (var p = Process.Start(psi)) { p.WaitForExit(10000); }
+            }
+            catch { }
+
+            foreach (var process in Process.GetProcessesByName("KickFox"))
+            {
+                try { process.Kill(); process.WaitForExit(5000); } catch { }
+            }
+        }
+
         private void BtnInstall_Click(object sender, EventArgs e)
         {
             btnInstall.Enabled = false;
@@ -148,12 +186,16 @@ namespace KickFox
                 if (!Directory.Exists(targetDir))
                     Directory.CreateDirectory(targetDir);
 
-                string sourceDir = AppDomain.CurrentDomain.BaseDirectory;
-                
-                // Copy files
-                File.Copy(Path.Combine(sourceDir, "KickFox.exe"), Path.Combine(targetDir, "KickFox.exe"), true);
-                File.Copy(Path.Combine(sourceDir, "KickFoxUninstaller.exe"), Path.Combine(targetDir, "KickFoxUninstaller.exe"), true);
-                File.Copy(Path.Combine(sourceDir, "Updater.exe"), Path.Combine(targetDir, "Updater.exe"), true);
+                // An existing install may be running; stop it so its files can be overwritten.
+                StopRunningInstances();
+
+                // The program files are embedded inside this installer, so a single
+                // downloaded KickFoxInstaller.exe is enough to install.
+                foreach (string name in PayloadFiles)
+                {
+                    ExtractPayload(name, Path.Combine(targetDir, name));
+                }
+                try { File.Delete(Path.Combine(targetDir, "Updater.new.exe")); } catch { }
 
                 // Register Scheduled Task (on logon, highest privilege)
                 string exePath = Path.Combine(targetDir, "KickFox.exe");
@@ -181,7 +223,7 @@ namespace KickFox
                         key.SetValue("DisplayIcon", Path.Combine(targetDir, "KickFox.exe"));
                         key.SetValue("UninstallString", string.Format("\"{0}\"", Path.Combine(targetDir, "KickFoxUninstaller.exe")));
                         key.SetValue("Publisher", "Shawn");
-                        key.SetValue("DisplayVersion", "1.0.0");
+                        key.SetValue("DisplayVersion", AppInfo.Version);
                         key.SetValue("NoModify", 1, RegistryValueKind.DWord);
                         key.SetValue("NoRepair", 1, RegistryValueKind.DWord);
                     }
@@ -204,7 +246,7 @@ namespace KickFox
             }
             catch (Exception ex)
             {
-                MessageBox.Show("Installation failed: " + ex.Message + "\nEnsure you have compiled KickFox.exe, KickFoxUninstaller.exe, and Updater.exe in the same folder.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                MessageBox.Show("Installation failed: " + ex.Message, "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 btnInstall.Enabled = true;
                 lblStatus.Text = "Failed.";
             }

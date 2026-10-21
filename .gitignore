@@ -1,0 +1,14 @@
+# Build output
+*.exe
+*.zip
+*.sig
+*.pdb
+dist/
+GitHub_Upload_Prep/
+
+# Signing keys - NEVER commit the private key
+*private*.xml
+
+# Logs / local tooling
+*.log
+__pycache__/
