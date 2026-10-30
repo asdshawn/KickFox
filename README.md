@@ -6,10 +6,15 @@
 <p align="center">A lightweight Windows tray utility that detects a dead internet connection and automatically restarts your Wi-Fi adapter.</p>
 
 ## Features
-- **Connectivity check** – pings a configurable, ordered list of targets (default `8.8.8.8`, `1.1.1.1`, `168.95.1.1`).
-- **Auto-kick** – if every target fails, KickFox disables and re-enables your Wi-Fi adapter(s).
+- **Connectivity check** – pings a configurable, ordered list of targets (default `8.8.8.8`, `1.1.1.1`, `168.95.1.1`). An outage is only confirmed after 3 failed rounds (5 s apart), so brief packet loss is ignored.
+- **Smart diagnosis** – before kicking, KickFox checks whether your router is still reachable (ICMP, then ARP):
+  - Router reachable → the problem is your modem/ISP, so Wi-Fi is **not** restarted.
+  - On a wired connection → Wi-Fi is **not** restarted.
+  - Wi-Fi disconnected or router unreachable → the Wi-Fi adapter is kicked.
+- **Respectful kicking** – only enabled Wi-Fi adapters are restarted; an adapter you disabled stays disabled.
+- **Sleep aware** – checks pause for 60 s after the PC resumes from sleep while Wi-Fi reconnects.
 - **Retry limit** – after the configured number of failed kicks it pauses for 30 minutes instead of looping forever.
-- **Animated tray icon** – normal / kicking / failed states, with live ping in the tooltip.
+- **Animated tray icon** – normal / kicking / failed / paused (greyed-out) states, with live ping in the tooltip.
 - **Signed auto-update** – checks GitHub Releases and only installs packages signed with the KickFox release key.
 
 ## Installation

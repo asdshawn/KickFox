@@ -6,14 +6,14 @@
 [assembly: AssemblyProduct("KickFox")]
 [assembly: AssemblyCompany("asdshawn")]
 [assembly: AssemblyCopyright("Copyright (c) 2026 asdshawn. MIT License.")]
-[assembly: AssemblyVersion("1.1.0.0")]
-[assembly: AssemblyFileVersion("1.1.0.0")]
+[assembly: AssemblyVersion("1.2.0.0")]
+[assembly: AssemblyFileVersion("1.2.0.0")]
 
 namespace KickFox
 {
     public static class AppInfo
     {
-        public const string Version = "1.1.0";
+        public const string Version = "1.2.0";
         public const string GitHubRepo = "asdshawn/KickFox";
         public const string UpdateAssetName = "Update.zip";
         public const string SignatureAssetName = "Update.zip.sig";

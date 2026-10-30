@@ -9,6 +9,10 @@ using System.Collections.Generic;
 using System.Security.Principal;
 using System.Net;
 using System.Web.Script.Serialization;
+using System.Net.Sockets;
+using System.Runtime.InteropServices;
+using System.Drawing.Imaging;
+using Microsoft.Win32;
 
 namespace KickFox
 {
@@ -132,7 +136,7 @@ namespace KickFox
         private System.Windows.Forms.Timer monitorTimer;
         private int consecutiveFailures = 0;
         private bool isSleeping = false;
-        private bool isChecking = false;
+        private volatile bool isChecking = false;
         private DateTime sleepUntil = DateTime.MinValue;
         private Config config;
         private string configPath;
@@ -143,9 +147,10 @@ namespace KickFox
         private Icon iconKickA;
         private Icon iconKickB;
         private Icon iconFatal;
+        private Icon iconPaused;
         private System.Windows.Forms.Timer animTimer;
         private bool isAnimFrameA = true;
-        private string currentTrayMode = "Normal"; // Normal, Kick, Fatal
+        private string currentTrayMode = "Normal"; // Normal, Kick, Fatal, Paused
 
         // UI Controls
         private CheckBox chkEnable;
@@ -206,9 +211,39 @@ namespace KickFox
             try { iconKickB = new Icon(asm.GetManifestResourceStream("IconKickB.ico")); } catch { iconKickB = SystemIcons.Warning; }
             try { iconFatal = new Icon(asm.GetManifestResourceStream("IconFatal.ico")); } catch { iconFatal = SystemIcons.Error; }
 
+            iconPaused = MakeGrayIcon(iconNormal) ?? iconFatal;
+
             animTimer = new System.Windows.Forms.Timer();
             animTimer.Interval = 500;
             animTimer.Tick += AnimTimer_Tick;
+        }
+
+        /// <summary>Greyed-out, semi-transparent copy of the normal icon: "monitoring disabled" (not "failed").</summary>
+        private static Icon MakeGrayIcon(Icon source)
+        {
+            try
+            {
+                using (Bitmap src = source.ToBitmap())
+                using (Bitmap gray = new Bitmap(src.Width, src.Height, PixelFormat.Format32bppArgb))
+                {
+                    using (Graphics g = Graphics.FromImage(gray))
+                    using (ImageAttributes attributes = new ImageAttributes())
+                    {
+                        attributes.SetColorMatrix(new ColorMatrix(new float[][] {
+                            new float[] { 0.30f, 0.30f, 0.30f, 0, 0 },
+                            new float[] { 0.59f, 0.59f, 0.59f, 0, 0 },
+                            new float[] { 0.11f, 0.11f, 0.11f, 0, 0 },
+                            new float[] { 0, 0, 0, 0.55f, 0 },
+                            new float[] { 0, 0, 0, 0, 1 } }));
+                        g.DrawImage(src, new Rectangle(0, 0, src.Width, src.Height), 0, 0, src.Width, src.Height, GraphicsUnit.Pixel, attributes);
+                    }
+                    return Icon.FromHandle(gray.GetHicon()); // created once per process; handle intentionally kept
+                }
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         private void AnimTimer_Tick(object sender, EventArgs e)
@@ -238,6 +273,11 @@ namespace KickFox
             {
                 animTimer.Stop();
                 trayIcon.Icon = iconFatal;
+            }
+            else if (mode == "Paused")
+            {
+                animTimer.Stop();
+                trayIcon.Icon = iconPaused;
             }
 
             if (tooltipText.Length > 63) tooltipText = tooltipText.Substring(0, 60) + "...";
@@ -698,7 +738,7 @@ namespace KickFox
             if (!config.IsEnabled)
             {
                 UpdateStatusUI(Color.Gray, "Monitoring is Disabled.");
-                SetTrayState("Fatal", "KickFox: 監控已停用");
+                SetTrayState("Paused", "KickFox: 監控已停用");
             }
             else
             {
@@ -728,11 +768,12 @@ namespace KickFox
             monitorTimer.Interval = config.CheckIntervalSeconds * 1000;
             monitorTimer.Tick += MonitorTimer_Tick;
             monitorTimer.Start();
+            SystemEvents.PowerModeChanged += OnPowerModeChanged;
             
             if (!config.IsEnabled)
             {
                 UpdateStatusUI(Color.Gray, "Monitoring is Disabled.");
-                SetTrayState("Fatal", "KickFox: 監控已停用");
+                SetTrayState("Paused", "KickFox: 監控已停用");
             }
             else
             {
@@ -741,10 +782,37 @@ namespace KickFox
             }
         }
 
+        // ───────────────────────── Connectivity monitoring ─────────────────────────
+
+        private enum Diagnosis { Online, WifiProblem, UpstreamViaWifi, UpstreamViaWired }
+
+        // A check only counts as "offline" after ConfirmRounds consecutive failed ping rounds,
+        // ConfirmDelayMs apart. This filters out momentary packet loss.
+        private const int ConfirmRounds = 3;
+        private const int ConfirmDelayMs = 5000;
+        // After waking from sleep, Wi-Fi needs time to reassociate; don't mistake that for an outage.
+        private const int ResumeGraceSeconds = 60;
+
+        private Diagnosis lastDiagnosis = Diagnosis.Online;
+        private DateTime resumeGraceUntil = DateTime.MinValue;
+
+        [DllImport("iphlpapi.dll", ExactSpelling = true)]
+        private static extern int SendARP(uint destIp, uint srcIp, byte[] macAddr, ref uint physicalAddrLen);
+
+        private void OnPowerModeChanged(object sender, PowerModeChangedEventArgs e)
+        {
+            if (e.Mode == PowerModes.Resume)
+            {
+                resumeGraceUntil = DateTime.Now.AddSeconds(ResumeGraceSeconds);
+                Log(string.Format("System resumed from sleep. Skipping checks for {0}s while Wi-Fi reconnects.", ResumeGraceSeconds));
+            }
+        }
+
         private void MonitorTimer_Tick(object sender, EventArgs e)
         {
             if (!config.IsEnabled) return;
             if (isChecking) return;
+            if (DateTime.Now < resumeGraceUntil) return;
 
             if (isSleeping)
             {
@@ -765,70 +833,165 @@ namespace KickFox
             ThreadPool.QueueUserWorkItem(CheckConnection);
         }
 
+        private bool PingAnyTarget(out long roundTrip)
+        {
+            roundTrip = 0;
+            foreach (string target in config.PingTargets.ToArray()) // snapshot: the list can be edited on the UI thread
+            {
+                try
+                {
+                    using (Ping ping = new Ping())
+                    {
+                        PingReply reply = ping.Send(target.Trim(), 2000);
+                        if (reply.Status == IPStatus.Success)
+                        {
+                            roundTrip = reply.RoundtripTime;
+                            return true;
+                        }
+                    }
+                }
+                catch { }
+            }
+            return false;
+        }
+
+        private static bool IsVirtualAdapter(NetworkInterface ni)
+        {
+            string text = (ni.Description + " " + ni.Name).ToLowerInvariant();
+            foreach (string keyword in new[] { "virtual", "hyper-v", "vmware", "virtualbox", "vpn", "tap-", "wintun", "wireguard", "tailscale", "zerotier", "bluetooth", "loopback" })
+            {
+                if (text.Contains(keyword)) return true;
+            }
+            return false;
+        }
+
+        private static bool IsGatewayReachable(IPAddress gateway)
+        {
+            try
+            {
+                using (Ping ping = new Ping())
+                {
+                    if (ping.Send(gateway, 1000).Status == IPStatus.Success) return true;
+                }
+            }
+            catch { }
+
+            try
+            {
+                // Many routers ignore ICMP. An ARP reply still proves the link to the router works.
+                byte[] mac = new byte[6];
+                uint length = (uint)mac.Length;
+                uint destination = BitConverter.ToUInt32(gateway.GetAddressBytes(), 0);
+                if (SendARP(destination, 0, mac, ref length) == 0 && length > 0) return true;
+            }
+            catch { }
+            return false;
+        }
+
+        /// <summary>
+        /// Internet is unreachable — figure out whether restarting Wi-Fi can actually help.
+        /// </summary>
+        private Diagnosis Diagnose()
+        {
+            bool wifiUp = false;
+            bool wiredUp = false;
+            var wifiGateways = new List<IPAddress>();
+
+            foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (ni.OperationalStatus != OperationalStatus.Up || IsVirtualAdapter(ni)) continue;
+
+                var gateways = new List<IPAddress>();
+                foreach (GatewayIPAddressInformation g in ni.GetIPProperties().GatewayAddresses)
+                {
+                    if (g.Address.AddressFamily == AddressFamily.InterNetwork && !g.Address.Equals(IPAddress.Any)) gateways.Add(g.Address);
+                }
+
+                switch (ni.NetworkInterfaceType)
+                {
+                    case NetworkInterfaceType.Wireless80211:
+                        wifiUp = true;
+                        wifiGateways.AddRange(gateways);
+                        break;
+                    case NetworkInterfaceType.Ethernet:
+                    case NetworkInterfaceType.GigabitEthernet:
+                    case NetworkInterfaceType.FastEthernetT:
+                    case NetworkInterfaceType.FastEthernetFx:
+                        if (gateways.Count > 0) wiredUp = true;
+                        break;
+                }
+            }
+
+            // Wi-Fi is associated and the router answers: the problem is upstream (modem / ISP).
+            if (wifiUp && wifiGateways.Exists(IsGatewayReachable)) return Diagnosis.UpstreamViaWifi;
+            // Connected by cable and Wi-Fi isn't in use: kicking Wi-Fi can't help.
+            if (!wifiUp && wiredUp) return Diagnosis.UpstreamViaWired;
+            // Not associated, no DHCP gateway, or router unreachable over Wi-Fi.
+            return Diagnosis.WifiProblem;
+        }
+
         private void CheckConnection(object state)
         {
             try
             {
-                bool isOnline = false;
-                long pingTime = 0;
-
-                foreach (var target in config.PingTargets)
+                long pingTime;
+                bool isOnline = PingAnyTarget(out pingTime);
+                for (int round = 1; !isOnline && round < ConfirmRounds; round++)
                 {
-                    try
-                    {
-                        using (Ping pingSender = new Ping())
-                        {
-                            PingReply reply = pingSender.Send(target.Trim(), 2000);
-                            if (reply.Status == IPStatus.Success)
-                            {
-                                isOnline = true;
-                                pingTime = reply.RoundtripTime;
-                                break;
-                            }
-                        }
-                    }
-                    catch { }
+                    Thread.Sleep(ConfirmDelayMs);
+                    isOnline = PingAnyTarget(out pingTime);
                 }
 
                 if (isOnline)
                 {
-                    if (consecutiveFailures > 0)
-                    {
-                        consecutiveFailures = 0;
-                        Log("Network connection restored successfully.");
-                    }
+                    if (lastDiagnosis != Diagnosis.Online) Log("Network connection restored.");
+                    lastDiagnosis = Diagnosis.Online;
+                    consecutiveFailures = 0;
                     UpdateStatusUI(Color.LimeGreen, "Network is online");
-                    this.Invoke(new Action(() => {
-                        SetTrayState("Normal", string.Format("KickFox: 連線正常 (Ping: {0}ms)", pingTime));
-                    }));
+                    long shownPing = pingTime;
+                    RunOnUI(delegate { SetTrayState("Normal", string.Format("KickFox: 連線正常 (Ping: {0}ms)", shownPing)); });
+                    return;
+                }
+
+                Diagnosis diagnosis = Diagnose();
+                bool changed = diagnosis != lastDiagnosis;
+                lastDiagnosis = diagnosis;
+
+                if (diagnosis == Diagnosis.UpstreamViaWifi)
+                {
+                    if (changed) Log("Internet unreachable, but Wi-Fi and router are fine (modem/ISP issue). Adapter NOT restarted.");
+                    UpdateStatusUI(Color.Orange, "Internet down, router reachable.\nLikely a modem/ISP issue - Wi-Fi not restarted.");
+                    RunOnUI(delegate { SetTrayState("Fatal", "KickFox: Wi-Fi 正常但外網中斷，請檢查數據機/ISP"); });
+                    return;
+                }
+
+                if (diagnosis == Diagnosis.UpstreamViaWired)
+                {
+                    if (changed) Log("Internet unreachable on a wired connection. Wi-Fi NOT restarted.");
+                    UpdateStatusUI(Color.Orange, "Internet down on wired connection.\nWi-Fi not restarted.");
+                    RunOnUI(delegate { SetTrayState("Fatal", "KickFox: 有線網路外網中斷，未重啟 Wi-Fi"); });
+                    return;
+                }
+
+                // The Wi-Fi link itself is broken: this is what kicking is for.
+                consecutiveFailures++;
+                string failMsg = string.Format("Wi-Fi link problem (not connected or router unreachable). Kick attempt {0}", consecutiveFailures);
+                if (config.UseMaxRetries) failMsg += string.Format("/{0}", config.MaxRetries);
+                Log(failMsg);
+
+                if (config.UseMaxRetries && consecutiveFailures > config.MaxRetries)
+                {
+                    isSleeping = true;
+                    sleepUntil = DateTime.Now.AddMinutes(30);
+                    UpdateStatusUI(Color.Red, "Max retries reached. Sleeping for 30 mins.");
+                    Log("Max retries reached. Entering sleep mode for 30 mins to prevent infinite loops.");
+                    RunOnUI(delegate { SetTrayState("Fatal", "KickFox: 重啟失敗，請檢查實體數據機或線路"); });
                 }
                 else
                 {
-                    consecutiveFailures++;
-                    
-                    string failMsg = string.Format("Ping failed. Attempt {0}", consecutiveFailures);
-                    if (config.UseMaxRetries) failMsg += string.Format("/{0}", config.MaxRetries);
-                    Log(failMsg);
-
-                    if (config.UseMaxRetries && consecutiveFailures > config.MaxRetries)
-                    {
-                        isSleeping = true;
-                        sleepUntil = DateTime.Now.AddMinutes(30);
-                        UpdateStatusUI(Color.Red, "Max retries reached. Sleeping for 30 mins.");
-                        Log("Max retries reached. Entering sleep mode for 30 mins to prevent infinite loops.");
-                        
-                        this.Invoke(new Action(() => {
-                            SetTrayState("Fatal", "KickFox: 重啟失敗，請檢查實體數據機或線路");
-                        }));
-                    }
-                    else
-                    {
-                        UpdateStatusUI(Color.Gold, "Restarting adapter...");
-                        this.Invoke(new Action(() => {
-                            SetTrayState("Kick", "KickFox: 偵測到斷線，正在踢醒網卡...");
-                        }));
-                        RestartWifi();
-                    }
+                    UpdateStatusUI(Color.Gold, "Restarting adapter...");
+                    RunOnUI(delegate { SetTrayState("Kick", "KickFox: 偵測到斷線，正在踢醒網卡..."); });
+                    RestartWifi();
                 }
             }
             finally
@@ -840,14 +1003,15 @@ namespace KickFox
         private void RestartWifi()
         {
             Log("Restarting Wi-Fi adapters...");
-            string psScript = @"Get-NetAdapter | Where-Object { $_.PhysicalMediaType -match '802.11' } | ForEach-Object { Disable-NetAdapter -Name $_.Name -Confirm:$false; Start-Sleep 5; Enable-NetAdapter -Name $_.Name -Confirm:$false }";
-            
+            // Only adapters that are enabled: never turn on a Wi-Fi adapter the user disabled on purpose.
+            string psScript = @"Get-NetAdapter | Where-Object { $_.PhysicalMediaType -match '802.11' -and $_.Status -ne 'Disabled' -and $_.Status -ne 'Not Present' } | ForEach-Object { Disable-NetAdapter -Name $_.Name -Confirm:$false; Start-Sleep 5; Enable-NetAdapter -Name $_.Name -Confirm:$false }";
+
             ProcessStartInfo psi = new ProcessStartInfo();
             psi.FileName = "powershell.exe";
-            psi.Arguments = string.Format("-WindowStyle Hidden -Command \"{0}\"", psScript);
+            psi.Arguments = string.Format("-NoProfile -WindowStyle Hidden -Command \"{0}\"", psScript);
             psi.CreateNoWindow = true;
             psi.UseShellExecute = false;
-            
+
             try
             {
                 using (Process p = Process.Start(psi))
@@ -856,14 +1020,13 @@ namespace KickFox
                 }
                 UpdateStatusUI(Color.Gold, "Wi-Fi restarted. Waiting 20s...");
                 Log("Wi-Fi restarted. Waiting 20s for reconnection...");
-                Thread.Sleep(20000); 
+                Thread.Sleep(20000);
             }
             catch (Exception ex)
             {
                 Log("Failed to execute restart command: " + ex.Message);
             }
         }
-
         private void MonitorForm_FormClosing(object sender, FormClosingEventArgs e)
         {
             if (e.CloseReason == CloseReason.UserClosing)
@@ -898,6 +1061,7 @@ namespace KickFox
 
         private void OnExit(object sender, EventArgs e)
         {
+            SystemEvents.PowerModeChanged -= OnPowerModeChanged; // static event: must unsubscribe
             trayIcon.Visible = false;
             Application.Exit();
         }
